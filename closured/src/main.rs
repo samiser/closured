@@ -5,7 +5,7 @@ use chrono::{SecondsFormat, Utc};
 use clap::{Parser, ValueEnum};
 #[rustfmt::skip]
 use log::{debug, warn};
-use closured_common::ExecEvent;
+use closured_common::{ExecEvent, FLAG_TMPFS, FLAG_UNLINKED};
 use serde::Serialize;
 use tokio::{
     io::{Interest, unix::AsyncFd},
@@ -88,9 +88,7 @@ fn with_privilege_hint<T>(res: Result<T, impl Into<anyhow::Error>>) -> anyhow::R
         .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
         .any(|io| matches!(io.raw_os_error(), Some(libc::EPERM | libc::EACCES)));
     if permission {
-        Err(err.context(
-            "insufficient privileges for loading the eBPF program (try sudo)",
-        ))
+        Err(err.context("insufficient privileges for loading the eBPF program (try sudo)"))
     } else {
         Err(err)
     }
@@ -101,23 +99,13 @@ fn cstr(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-/// What kind of thing ran. Policy outcomes (audited/denied) are expressed
-/// via the ECS `event` fields instead so this can stay purely descriptive.
-fn classify(path: &str) -> &'static str {
-    if path.starts_with("/memfd:") {
-        // memfd_create + execveat: d_path renders these as "/memfd:name (deleted)"
-        "memory"
-    } else if path.ends_with(" (deleted)") {
-        // Unlinked file (O_TMPFILE, deleted binary) exec'd via a held fd,
-        // e.g. through /proc/self/fd/N. Checked before the store prefix:
-        // a deleted store path is not the closure's file anymore.
-        //
-        // TODO: move this detection into the eBPF program by checking the
-        // inode link count (file->f_inode->i_nlink == 0) and carrying the
-        // classification in ExecEvent, instead of relying on d_path's
-        // " (deleted)" rendering convention, which a crafted path name
-        // can spoof.
-        "deleted"
+fn get_classification(path: &str, flags: u8) -> &'static str {
+    if flags & FLAG_UNLINKED != 0 {
+        if flags & FLAG_TMPFS != 0 {
+            "memory"
+        } else {
+            "deleted"
+        }
     } else if path.starts_with("/nix/store/") {
         "store"
     } else {
@@ -128,7 +116,7 @@ fn classify(path: &str) -> &'static str {
 fn handle_event(ev: &ExecEvent, format: Format) -> anyhow::Result<()> {
     let path = cstr(&ev.path);
     let comm = cstr(&ev.comm);
-    let classification = classify(&path);
+    let classification = get_classification(&path, ev.flags);
 
     match format {
         Format::Text => {
