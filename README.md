@@ -18,7 +18,7 @@ sudo ./result/bin/closured   # loading the eBPF program needs root
 ```
 or just
 ```shell
-nix run
+sudo nix run
 ```
 
 ## Development
