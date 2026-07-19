@@ -34,7 +34,7 @@ systemd service:
   services.closured.enable = true;
 ```
 
-Events are logged as NDJSON: `journalctl -u closured -o cat | jq`
+Events are logged as NDJSON: `journalctl -u closured -o cat | grep '^{' | jq`
 
 ## Development
 
