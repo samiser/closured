@@ -77,6 +77,25 @@ struct ClosuredFields {
     classification: &'static str,
 }
 
+/// Adds a privileges hint when an eBPF setup step failed on permissions for a friendlier error
+fn with_privilege_hint<T>(res: Result<T, impl Into<anyhow::Error>>) -> anyhow::Result<T> {
+    let err = match res {
+        Ok(v) => return Ok(v),
+        Err(e) => e.into(),
+    };
+    let permission = err
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| matches!(io.raw_os_error(), Some(libc::EPERM | libc::EACCES)));
+    if permission {
+        Err(err.context(
+            "insufficient privileges for loading the eBPF program (try sudo)",
+        ))
+    } else {
+        Err(err)
+    }
+}
+
 fn cstr(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
@@ -175,12 +194,14 @@ async fn main() -> anyhow::Result<()> {
     // runtime. This approach is recommended for most real-world use cases. If you would
     // like to specify the eBPF program at runtime rather than at compile-time, you can
     // reach for `Bpf::load_file` instead.
-    let mut ebpf = aya::EbpfLoader::new()
-        .override_global("AUDIT_ALL", &u8::from(args.all), true)
-        .load(aya::include_bytes_aligned!(concat!(
-            env!("OUT_DIR"),
-            "/closured"
-        )))?;
+    let mut ebpf = with_privilege_hint(
+        aya::EbpfLoader::new()
+            .override_global("AUDIT_ALL", &u8::from(args.all), true)
+            .load(aya::include_bytes_aligned!(concat!(
+                env!("OUT_DIR"),
+                "/closured"
+            ))),
+    )?;
     match aya_log::EbpfLogger::init(&mut ebpf) {
         Err(e) => {
             // This can happen if you remove all log statements from your eBPF program.
@@ -203,8 +224,8 @@ async fn main() -> anyhow::Result<()> {
         .program_mut("bprm_check_security")
         .unwrap()
         .try_into()?;
-    program.load("bprm_check_security", &btf)?;
-    program.attach()?;
+    with_privilege_hint(program.load("bprm_check_security", &btf))?;
+    with_privilege_hint(program.attach())?;
 
     let ring = RingBuf::try_from(ebpf.take_map("EVENTS").unwrap())?;
     let mut ring = AsyncFd::with_interest(ring, Interest::READABLE)?;
