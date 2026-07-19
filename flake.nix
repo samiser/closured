@@ -5,6 +5,7 @@
     crane.url = "github:ipetkov/crane";
   };
   outputs = {
+    self,
     nixpkgs,
     fenix,
     crane,
@@ -57,6 +58,8 @@
       });
   in {
     packages.${system}.default = closured;
+
+    nixosModules.default = import ./nix/module.nix self;
 
     devShells.${system}.default = pkgs.mkShell {
       packages = [

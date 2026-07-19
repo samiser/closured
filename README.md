@@ -21,6 +21,21 @@ or just
 sudo nix run
 ```
 
+## NixOS module
+
+The flake exports a NixOS module that runs closured as a hardened
+systemd service:
+
+```nix
+{
+  inputs.closured.url = "github:Samiser/closured";
+
+  imports = [inputs.closured.nixosModules.default];
+  services.closured.enable = true;
+```
+
+Events are logged as NDJSON: `journalctl -u closured -o cat | jq`
+
 ## Development
 
 `nix develop` gives you a shell where you can build with cargo
