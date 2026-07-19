@@ -7,29 +7,23 @@ closured uses eBPF LSM hooks to ensure your NixOS system only executes what its 
 
 ## Prerequisites
 
-`nix develop` gives you a build environment
-
-Runtime requirements on the target machine:
-
 1. kernel >= 6.12 with BTF (`/sys/kernel/btf/vmlinux`)
 2. the BPF LSM enabled (`bpf` present in the active LSM list: `cat /sys/kernel/security/lsm`)
 
 ## Build & Run
 
-Within the devshell use `cargo build`, `cargo check`, etc. as normal. Run with:
-
 ```shell
-cargo run --release
+nix build
+sudo ./result/bin/closured   # loading the eBPF program needs root
+```
+or just
+```shell
+nix run
 ```
 
-By default only executions from outside `/nix/store` are reported.
-Pass `--all` to see everything.
+## Development
 
-Events are emitted on stdout as ECS-shaped NDJSON by default.
-Pass `--format text` for human-readable lines.
-
-Cargo build scripts are used to automatically build the eBPF correctly
-and include it in the program.
+`nix develop` gives you a shell where you can build with cargo
 
 ## License
 

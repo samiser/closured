@@ -2,10 +2,12 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     fenix.url = "github:nix-community/fenix";
+    crane.url = "github:ipetkov/crane";
   };
   outputs = {
     nixpkgs,
     fenix,
+    crane,
     ...
   }: let
     system = "x86_64-linux";
@@ -15,6 +17,7 @@
       date = "2026-01-01";
       sha256 = "sha256-KTCPimYDgP3en6gZzClSIezJ75wuFRnhhja93KsVxA0=";
     }).withComponents ["cargo" "rustc" "rust-src" "clippy" "rustfmt"];
+    craneLib = (crane.mkLib pkgs).overrideToolchain (_: toolchain);
     aya-tool = pkgs.rustPlatform.buildRustPackage {
       pname = "aya-tool";
       version = "unstable-2026-07";
@@ -28,7 +31,33 @@
       cargoBuildFlags = ["-p" "aya-tool"];
       doCheck = false;
     };
+    commonArgs = {
+      src = craneLib.cleanCargoSource ./.;
+      pname = "closured";
+      version = "0.1.0";
+      strictDeps = true;
+      # aya-build compiles with `-Z build-std=core`, which resolves the
+      # toolchain's own library workspace, so we need to vendor the lock
+      cargoVendorDir = craneLib.vendorMultipleCargoDeps {
+        cargoLockList = [
+          ./Cargo.lock
+          "${toolchain}/lib/rustlib/src/rust/library/Cargo.lock"
+        ];
+      };
+      nativeBuildInputs = [
+        pkgs.bpf-linker
+        pkgs.llvmPackages.bintools-unwrapped
+      ];
+      doCheck = false;
+    };
+    cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+    closured = craneLib.buildPackage (commonArgs
+      // {
+        inherit cargoArtifacts;
+      });
   in {
+    packages.${system}.default = closured;
+
     devShells.${system}.default = pkgs.mkShell {
       packages = [
         toolchain

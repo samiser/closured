@@ -10,3 +10,7 @@ target/
 
 .envrc
 .direnv
+
+# nix build output
+result
+result-*

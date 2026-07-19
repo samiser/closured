@@ -1,5 +1,20 @@
 {
   "nodes": {
+    "crane": {
+      "locked": {
+        "lastModified": 1784407669,
+        "narHash": "sha256-gcFMcRjw0ZSn380Rx2QLlU1goUQeSrKX/DF12omI6+o=",
+        "owner": "ipetkov",
+        "repo": "crane",
+        "rev": "1316b7d278ad77a16aec024b71d971366e123bec",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ipetkov",
+        "repo": "crane",
+        "type": "github"
+      }
+    },
     "fenix": {
       "inputs": {
         "nixpkgs": "nixpkgs",
@@ -53,6 +68,7 @@
     },
     "root": {
       "inputs": {
+        "crane": "crane",
         "fenix": "fenix",
         "nixpkgs": "nixpkgs_2"
       }
