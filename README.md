@@ -22,7 +22,14 @@ Within the devshell use `cargo build`, `cargo check`, etc. as normal. Run with:
 cargo run --release
 ```
 
-Cargo build scripts are used to automatically build the eBPF correctly and include it in the program.
+By default only executions from outside `/nix/store` are reported.
+Pass `--all` to see everything.
+
+Events are emitted on stdout as ECS-shaped NDJSON by default.
+Pass `--format text` for human-readable lines.
+
+Cargo build scripts are used to automatically build the eBPF correctly
+and include it in the program.
 
 ## License
 

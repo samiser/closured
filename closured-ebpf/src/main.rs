@@ -33,6 +33,28 @@ unsafe extern "C" {
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
+#[unsafe(no_mangle)]
+static AUDIT_ALL: u8 = 0;
+
+const STORE_PREFIX: &[u8; 11] = b"/nix/store/";
+const DELETED_SUFFIX: &[u8; 10] = b" (deleted)";
+
+#[inline(always)]
+fn is_deleted(path: &[u8; 256], len_with_nul: usize) -> bool {
+    if len_with_nul < 11 || len_with_nul > path.len() {
+        return false;
+    }
+    let start = len_with_nul - 11;
+    let mut i = 0;
+    while i < DELETED_SUFFIX.len() {
+        match path.get(start + i) {
+            Some(b) if *b == DELETED_SUFFIX[i] => i += 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
 #[lsm(hook = "bprm_check_security")]
 pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     let _ = try_bprm_check_security(&ctx).unwrap_or(0);
@@ -55,6 +77,11 @@ fn try_bprm_check_security(ctx: &LsmContext) -> Result<i32, i32> {
         unsafe { bpf_path_d_path(f_path, ev.path.as_mut_ptr().cast::<c_char>(), ev.path.len()) };
     if ret < 0 {
         return Err(ret);
+    }
+
+    let audit_all = unsafe { core::ptr::read_volatile(&raw const AUDIT_ALL) } != 0;
+    if !audit_all && ev.path.starts_with(STORE_PREFIX) && !is_deleted(&ev.path, ret as usize) {
+        return Ok(0);
     }
 
     info!(&ctx, "lsm hook bprm_check_security called");

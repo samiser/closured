@@ -33,6 +33,7 @@
       packages = [
         toolchain
         aya-tool
+        pkgs.bacon
         pkgs.bpf-linker
         pkgs.bpftools
         pkgs.cargo-generate
