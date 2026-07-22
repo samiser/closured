@@ -13,11 +13,12 @@
   }: let
     system = "x86_64-linux";
     pkgs = nixpkgs.legacyPackages.${system};
-    toolchain = (fenix.packages.${system}.toolchainOf {
+    toolchainPkgs = fenix.packages.${system}.toolchainOf {
       channel = "nightly";
       date = "2026-01-01";
       sha256 = "sha256-KTCPimYDgP3en6gZzClSIezJ75wuFRnhhja93KsVxA0=";
-    }).withComponents ["cargo" "rustc" "rust-src" "clippy" "rustfmt"];
+    };
+    toolchain = toolchainPkgs.withComponents ["cargo" "rustc" "rust-src" "clippy" "rustfmt"];
     craneLib = (crane.mkLib pkgs).overrideToolchain (_: toolchain);
     aya-tool = pkgs.rustPlatform.buildRustPackage {
       pname = "aya-tool";
@@ -38,11 +39,11 @@
       version = "0.1.0";
       strictDeps = true;
       # aya-build compiles with `-Z build-std=core`, which resolves the
-      # toolchain's own library workspace, so we need to vendor the lock
+      # toolchain's own library workspace, so we need to vendor the lock.
       cargoVendorDir = craneLib.vendorMultipleCargoDeps {
         cargoLockList = [
           ./Cargo.lock
-          "${toolchain}/lib/rustlib/src/rust/library/Cargo.lock"
+          "${toolchainPkgs.rust-src}/lib/rustlib/src/rust/library/Cargo.lock"
         ];
       };
       nativeBuildInputs = [
