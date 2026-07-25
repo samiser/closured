@@ -108,6 +108,8 @@ fn get_classification(path: &str, flags: u8) -> &'static str {
         }
     } else if path.starts_with("/nix/store/") {
         "store"
+    } else if path.starts_with("/run/wrappers/") {
+        "wrapper"
     } else {
         "outside"
     }
@@ -122,6 +124,7 @@ fn handle_event(ev: &ExecEvent, format: Format) -> anyhow::Result<()> {
         Format::Text => {
             let label = match classification {
                 "store" => "store  ",
+                "wrapper" => "wrapper",
                 "memory" => "MEMORY ",
                 "deleted" => "DELETED",
                 _ => "OUTSIDE",
