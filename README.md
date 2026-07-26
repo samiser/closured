@@ -5,6 +5,23 @@
 
 closured uses eBPF LSM hooks to ensure your NixOS system only executes what its closure declares, either auditing or blocking other attempted executions
 
+On startup closured builds an allowlist from the requisites of its closure
+roots (`/run/current-system`, `/run/booted-system` and
+`/nix/var/nix/profiles/system` by default and reports any exec that falls
+outside it. Events are classified as:
+
+- `closure`: a store path in the allowed closure (only reported with `--all`)
+- `store`: a store path not in the allowed closure
+- `wrapper`: a setuid wrapper under `/run/wrappers`
+- `memory` / `deleted`: an unlinked executable (memfd or deleted file)
+- `outside`: anything else
+
+The allowlist refreshes automatically when a closure root changes (inotify
+on the roots' parent directories, with a periodic fallback poll), so a
+deploy is picked up without a restart. The system profile repoints before
+activation runs, which lets the new generation's paths become allowed
+early in the switch.
+
 ## Prerequisites
 
 1. kernel >= 6.12 with BTF (`/sys/kernel/btf/vmlinux`)

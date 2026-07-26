@@ -36,6 +36,9 @@ in {
       description = "eBPF LSM exec auditor";
       wantedBy = ["multi-user.target"];
 
+      # closured shells out to nix-store to gather the allowed closure
+      path = [config.nix.package];
+
       serviceConfig = {
         ExecStart = "${lib.getExe' cfg.package "closured"} ${lib.escapeShellArgs cfg.extraFlags}";
         Restart = "on-failure";

@@ -17,3 +17,9 @@ pub const FLAG_UNLINKED: u8 = 1 << 0;
 /// The executable is backed by tmpfs (superblock magic), i.e. RAM/swap
 /// rather than a persistent filesystem.
 pub const FLAG_TMPFS: u8 = 1 << 1;
+
+/// The executable's store path is in the allowed closure.
+pub const FLAG_IN_CLOSURE: u8 = 1 << 2;
+
+/// Length of the base32 hash in `/nix/store/<hash>-<name>`.
+pub const STORE_HASH_LEN: usize = 32;

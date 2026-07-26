@@ -21,11 +21,11 @@ use aya_ebpf::{
         bpf_probe_read_kernel,
     },
     macros::{lsm, map},
-    maps::RingBuf,
+    maps::{HashMap, RingBuf},
     programs::LsmContext,
 };
 use aya_log_ebpf::info;
-use closured_common::{ExecEvent, FLAG_TMPFS, FLAG_UNLINKED};
+use closured_common::{ExecEvent, FLAG_IN_CLOSURE, FLAG_TMPFS, FLAG_UNLINKED, STORE_HASH_LEN};
 use vmlinux::{file, linux_binprm, path};
 
 #[allow(improper_ctypes)]
@@ -35,6 +35,10 @@ unsafe extern "C" {
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Store-path hash components of the allowed closure, populated by userspace.
+#[map]
+static ALLOWED: HashMap<[u8; STORE_HASH_LEN], u8> = HashMap::with_max_entries(65536, 0);
 
 #[unsafe(no_mangle)]
 static AUDIT_ALL: u8 = 0;
@@ -86,8 +90,17 @@ fn try_bprm_check_security(ctx: &LsmContext) -> Result<i32, i32> {
         return Err(ret);
     }
 
+    if ev.path.starts_with(STORE_PREFIX)
+        && let Ok(hash) = <&[u8; STORE_HASH_LEN]>::try_from(
+            &ev.path[STORE_PREFIX.len()..STORE_PREFIX.len() + STORE_HASH_LEN],
+        )
+        && unsafe { ALLOWED.get(hash) }.is_some()
+    {
+        ev.flags |= FLAG_IN_CLOSURE;
+    }
+
     let audit_all = unsafe { core::ptr::read_volatile(&raw const AUDIT_ALL) } != 0;
-    if !audit_all && ev.path.starts_with(STORE_PREFIX) && ev.flags & FLAG_UNLINKED == 0 {
+    if !audit_all && ev.flags & FLAG_IN_CLOSURE != 0 && ev.flags & FLAG_UNLINKED == 0 {
         return Ok(0);
     }
 
