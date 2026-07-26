@@ -10,7 +10,7 @@ use chrono::{SecondsFormat, Utc};
 use clap::{Parser, ValueEnum};
 #[rustfmt::skip]
 use log::{debug, warn};
-use closured_common::{ExecEvent, FLAG_IN_CLOSURE, FLAG_TMPFS, FLAG_UNLINKED, STORE_HASH_LEN};
+use closured_common::{Classification, ExecEvent, STORE_HASH_LEN};
 use serde::Serialize;
 use tokio::{
     io::{Interest, unix::AsyncFd},
@@ -107,24 +107,6 @@ fn with_privilege_hint<T>(res: Result<T, impl Into<anyhow::Error>>) -> anyhow::R
 fn cstr(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
-}
-
-fn get_classification(path: &str, flags: u8) -> &'static str {
-    if flags & FLAG_UNLINKED != 0 {
-        if flags & FLAG_TMPFS != 0 {
-            "memory"
-        } else {
-            "deleted"
-        }
-    } else if flags & FLAG_IN_CLOSURE != 0 {
-        "closure"
-    } else if path.starts_with("/nix/store/") {
-        "store"
-    } else if path.starts_with("/run/wrappers/") {
-        "wrapper"
-    } else {
-        "outside"
-    }
 }
 
 type StoreHash = [u8; STORE_HASH_LEN];
@@ -240,17 +222,23 @@ fn populate_allowed(
 fn handle_event(ev: &ExecEvent, format: Format) -> anyhow::Result<()> {
     let path = cstr(&ev.path);
     let comm = cstr(&ev.comm);
-    let classification = get_classification(&path, ev.flags);
+    let Some(classification) = Classification::from_u8(ev.classification) else {
+        warn!(
+            "dropping event with unknown classification {}: pid={} path={path}",
+            ev.classification, ev.pid
+        );
+        return Ok(());
+    };
 
     match format {
         Format::Text => {
             let label = match classification {
-                "closure" => "closure",
-                "store" => "STORE  ",
-                "wrapper" => "wrapper",
-                "memory" => "MEMORY ",
-                "deleted" => "DELETED",
-                _ => "OUTSIDE",
+                Classification::Closure => "closure",
+                Classification::Store => "STORE  ",
+                Classification::Wrapper => "wrapper",
+                Classification::Memory => "MEMORY ",
+                Classification::Deleted => "DELETED",
+                Classification::Outside => "OUTSIDE",
             };
             println!(
                 "[{label}] pid={} uid={} comm={comm} path={path}",
@@ -278,7 +266,9 @@ fn handle_event(ev: &ExecEvent, format: Format) -> anyhow::Result<()> {
                 user: UserFields {
                     id: ev.uid.to_string(),
                 },
-                closured: ClosuredFields { classification },
+                closured: ClosuredFields {
+                    classification: classification.as_str(),
+                },
             };
             let mut out = std::io::stdout().lock();
             serde_json::to_writer(&mut out, &event)?;

@@ -25,7 +25,7 @@ use aya_ebpf::{
     programs::LsmContext,
 };
 use aya_log_ebpf::info;
-use closured_common::{ExecEvent, FLAG_IN_CLOSURE, FLAG_TMPFS, FLAG_UNLINKED, STORE_HASH_LEN};
+use closured_common::{Classification, ExecEvent, FLAG_TMPFS, FLAG_UNLINKED, STORE_HASH_LEN};
 use vmlinux::{file, linux_binprm, path};
 
 #[allow(improper_ctypes)]
@@ -44,6 +44,7 @@ static ALLOWED: HashMap<[u8; STORE_HASH_LEN], u8> = HashMap::with_max_entries(65
 static AUDIT_ALL: u8 = 0;
 
 const STORE_PREFIX: &[u8; 11] = b"/nix/store/";
+const WRAPPER_PREFIX: &[u8; 14] = b"/run/wrappers/";
 
 /// From `include/uapi/linux/magic.h`.
 const TMPFS_MAGIC: u64 = 0x0102_1994;
@@ -65,6 +66,30 @@ fn inode_flags(file: *mut file) -> Result<u8, i64> {
     Ok(flags)
 }
 
+#[inline(always)]
+fn classify(path: &[u8; 256], flags: u8) -> Classification {
+    if flags & FLAG_UNLINKED != 0 {
+        return if flags & FLAG_TMPFS != 0 {
+            Classification::Memory
+        } else {
+            Classification::Deleted
+        };
+    }
+    if path.starts_with(STORE_PREFIX) {
+        if let Ok(hash) = <&[u8; STORE_HASH_LEN]>::try_from(
+            &path[STORE_PREFIX.len()..STORE_PREFIX.len() + STORE_HASH_LEN],
+        ) && unsafe { ALLOWED.get(hash) }.is_some()
+        {
+            return Classification::Closure;
+        }
+        return Classification::Store;
+    }
+    if path.starts_with(WRAPPER_PREFIX) {
+        return Classification::Wrapper;
+    }
+    Classification::Outside
+}
+
 #[lsm(hook = "bprm_check_security")]
 pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     let _ = try_bprm_check_security(&ctx).unwrap_or(0);
@@ -80,7 +105,7 @@ fn try_bprm_check_security(ctx: &LsmContext) -> Result<i32, i32> {
         uid: bpf_get_current_uid_gid() as u32,
         comm: bpf_get_current_comm().unwrap_or_default(),
         path: [0u8; 256],
-        flags: inode_flags(file).unwrap_or(0),
+        classification: Classification::Outside as u8,
     };
 
     let f_path = unsafe { &raw mut (*file).__bindgen_anon_1.f_path };
@@ -90,17 +115,11 @@ fn try_bprm_check_security(ctx: &LsmContext) -> Result<i32, i32> {
         return Err(ret);
     }
 
-    if ev.path.starts_with(STORE_PREFIX)
-        && let Ok(hash) = <&[u8; STORE_HASH_LEN]>::try_from(
-            &ev.path[STORE_PREFIX.len()..STORE_PREFIX.len() + STORE_HASH_LEN],
-        )
-        && unsafe { ALLOWED.get(hash) }.is_some()
-    {
-        ev.flags |= FLAG_IN_CLOSURE;
-    }
+    let classification = classify(&ev.path, inode_flags(file).unwrap_or(0));
+    ev.classification = classification as u8;
 
     let audit_all = unsafe { core::ptr::read_volatile(&raw const AUDIT_ALL) } != 0;
-    if !audit_all && ev.flags & FLAG_IN_CLOSURE != 0 && ev.flags & FLAG_UNLINKED == 0 {
+    if !audit_all && classification == Classification::Closure {
         return Ok(0);
     }
 
