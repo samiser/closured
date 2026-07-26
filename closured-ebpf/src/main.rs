@@ -21,12 +21,13 @@ use aya_ebpf::{
         bpf_probe_read_kernel,
     },
     macros::{lsm, map},
-    maps::{Array, HashMap, RingBuf},
+    maps::{Array, HashMap, PerCpuArray, RingBuf},
     programs::LsmContext,
 };
 use aya_log_ebpf::info;
 use closured_common::{
-    Action, CLASSIFICATIONS, Classification, ExecEvent, FLAG_TMPFS, FLAG_UNLINKED, STORE_HASH_LEN,
+    Action, CLASSIFICATIONS, Classification, ExecEvent, FLAG_TMPFS, FLAG_UNLINKED, PATH_MAX,
+    STORE_HASH_LEN,
 };
 use vmlinux::{file, linux_binprm, path};
 
@@ -45,6 +46,17 @@ static ALLOWED: HashMap<[u8; STORE_HASH_LEN], u8> = HashMap::with_max_entries(65
 /// [`Action`] per [`Classification`], indexed by discriminant, set by userspace.
 #[map]
 static POLICY: Array<u8> = Array::with_max_entries(CLASSIFICATIONS as u32, 0);
+
+/// A record is assembled here rather than on the stack: a `PATH_MAX` path
+/// blows the 512-byte BPF stack limit.
+#[repr(C)]
+struct EventBuf {
+    event: ExecEvent,
+    path: [u8; PATH_MAX],
+}
+
+#[map]
+static SCRATCH: PerCpuArray<EventBuf> = PerCpuArray::with_max_entries(1, 0);
 
 const EPERM: i32 = 1;
 
@@ -72,7 +84,7 @@ fn inode_flags(file: *mut file) -> Result<u8, i64> {
 }
 
 #[inline(always)]
-fn classify(path: &[u8; 256], flags: u8) -> Classification {
+fn classify(path: &[u8; PATH_MAX], flags: u8) -> Classification {
     if flags & FLAG_UNLINKED != 0 {
         return if flags & FLAG_TMPFS != 0 {
             Classification::Memory
@@ -116,36 +128,47 @@ fn try_bprm_check_security(ctx: &LsmContext) -> Result<i32, i32> {
     let bprm: *const linux_binprm = ctx.arg(0);
     let file = unsafe { (*bprm).file };
 
-    let mut ev = ExecEvent {
-        pid: (bpf_get_current_pid_tgid() >> 32) as u32,
-        uid: bpf_get_current_uid_gid() as u32,
-        comm: bpf_get_current_comm().unwrap_or_default(),
-        path: [0u8; 256],
-        classification: Classification::Outside as u8,
-        action: Action::Allow as u8,
-    };
+    let buf = SCRATCH.get_ptr_mut(0).ok_or(0)?;
 
     let f_path = unsafe { &raw mut (*file).__bindgen_anon_1.f_path };
-    let ret =
-        unsafe { bpf_path_d_path(f_path, ev.path.as_mut_ptr().cast::<c_char>(), ev.path.len()) };
+    let ret = unsafe { bpf_path_d_path(f_path, (&raw mut (*buf).path).cast::<c_char>(), PATH_MAX) };
     if ret < 0 {
         return Err(ret);
     }
+    // keeps the record length provably within the scratch buffer
+    let path_len = if ret as usize > PATH_MAX {
+        PATH_MAX
+    } else {
+        ret as usize
+    };
 
-    let classification = classify(&ev.path, inode_flags(file).unwrap_or(0));
-    ev.classification = classification as u8;
-
+    let classification = classify(unsafe { &(*buf).path }, inode_flags(file).unwrap_or(0));
     let action = policy_for(classification);
-    ev.action = action as u8;
     if action == Action::Allow {
         return Ok(0);
     }
 
+    unsafe {
+        (*buf).event = ExecEvent {
+            pid: (bpf_get_current_pid_tgid() >> 32) as u32,
+            uid: bpf_get_current_uid_gid() as u32,
+            comm: bpf_get_current_comm().unwrap_or_default(),
+            classification: classification as u8,
+            action: action as u8,
+        };
+    }
+
     info!(&ctx, "lsm hook bprm_check_security called");
     // a full ring buffer must not turn a deny into an allow
-    let _ = EVENTS.output::<ExecEvent>(&ev, 0);
+    let record =
+        unsafe { core::slice::from_raw_parts(buf.cast::<u8>(), size_of::<ExecEvent>() + path_len) };
+    let _ = EVENTS.output::<[u8]>(record, 0);
 
-    if action == Action::Deny { Ok(-EPERM) } else { Ok(0) }
+    if action == Action::Deny {
+        Ok(-EPERM)
+    } else {
+        Ok(0)
+    }
 }
 
 #[cfg(not(test))]

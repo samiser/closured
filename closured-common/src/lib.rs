@@ -1,15 +1,18 @@
 #![no_std]
 
+/// Ring buffer records are this header followed by the executable's path,
+/// NUL-terminated, whose length is the remainder of the record.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ExecEvent {
     pub pid: u32,
     pub uid: u32,
     pub comm: [u8; 16],
-    pub path: [u8; 256],
     pub classification: u8,
     pub action: u8,
 }
+
+pub const PATH_MAX: usize = 4096;
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -276,8 +276,8 @@ fn populate_allowed(
     (added, removed)
 }
 
-fn handle_event(ev: &ExecEvent, format: Format) -> anyhow::Result<()> {
-    let path = cstr(&ev.path);
+fn handle_event(ev: &ExecEvent, path: &[u8], format: Format) -> anyhow::Result<()> {
+    let path = cstr(path);
     let comm = cstr(&ev.comm);
     let (Some(classification), Some(action)) = (
         Classification::from_u8(ev.classification),
@@ -300,7 +300,11 @@ fn handle_event(ev: &ExecEvent, format: Format) -> anyhow::Result<()> {
                 Classification::Deleted => "DELETED",
                 Classification::Outside => "OUTSIDE",
             };
-            let denied = if action == Action::Deny { " DENIED" } else { "" };
+            let denied = if action == Action::Deny {
+                " DENIED"
+            } else {
+                ""
+            };
             println!(
                 "[{label}]{denied} pid={} uid={} comm={comm} path={path}",
                 ev.pid, ev.uid
@@ -373,9 +377,9 @@ async fn main() -> anyhow::Result<()> {
     // runtime. This approach is recommended for most real-world use cases. If you would
     // like to specify the eBPF program at runtime rather than at compile-time, you can
     // reach for `Bpf::load_file` instead.
-    let mut ebpf = with_privilege_hint(aya::EbpfLoader::new().load(
-        aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/closured")),
-    ))?;
+    let mut ebpf = with_privilege_hint(aya::EbpfLoader::new().load(aya::include_bytes_aligned!(
+        concat!(env!("OUT_DIR"), "/closured")
+    )))?;
     match aya_log::EbpfLogger::init(&mut ebpf) {
         Err(e) => {
             // This can happen if you remove all log statements from your eBPF program.
@@ -395,7 +399,8 @@ async fn main() -> anyhow::Result<()> {
     }
     // Fill the allowlist and policy before the hook attaches, so no exec sees a
     // partial closure or an unset policy
-    let mut allowed: HashMap<_, StoreHash, u8> = HashMap::try_from(ebpf.take_map("ALLOWED").unwrap())?;
+    let mut allowed: HashMap<_, StoreHash, u8> =
+        HashMap::try_from(ebpf.take_map("ALLOWED").unwrap())?;
     populate_allowed(&mut allowed, &HashSet::new(), &closure);
 
     let mut policy_map: Array<_, u8> = Array::try_from(ebpf.take_map("POLICY").unwrap())?;
@@ -463,8 +468,7 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
             let gather_roots = roots.clone();
-            let gathered =
-                tokio::task::spawn_blocking(move || gather_closure(&gather_roots)).await;
+            let gathered = tokio::task::spawn_blocking(move || gather_closure(&gather_roots)).await;
             match gathered.unwrap_or_else(|e| Err(e.into())) {
                 Ok(new_closure) => {
                     let (added, removed) = populate_allowed(&mut allowed, &closure, &new_closure);
@@ -487,11 +491,12 @@ async fn main() -> anyhow::Result<()> {
                 let mut guard = guard?;
                 let rb = guard.get_inner_mut();
                 while let Some(item) = rb.next() {
-                    if item.len() >= core::mem::size_of::<ExecEvent>() {
+                    let header = core::mem::size_of::<ExecEvent>();
+                    if item.len() >= header {
                         let ev: ExecEvent = unsafe {
                             std::ptr::read_unaligned(item.as_ptr() as *const ExecEvent)
                         };
-                        handle_event(&ev, args.format)?;
+                        handle_event(&ev, &item[header..], args.format)?;
                     }
                 }
                 guard.clear_ready();
