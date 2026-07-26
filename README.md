@@ -7,7 +7,7 @@ closured uses eBPF LSM hooks to ensure your NixOS system only executes what its 
 
 On startup closured builds an allowlist from the requisites of its closure
 roots (`/run/current-system`, `/run/booted-system` and
-`/nix/var/nix/profiles/system` by default and reports any exec that falls
+`/nix/var/nix/profiles/system` by default) and reports any exec that falls
 outside it. Events are classified as:
 
 - `closure`: a store path in the allowed closure (only reported with `--all`)
