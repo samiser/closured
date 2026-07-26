@@ -8,6 +8,7 @@ pub struct ExecEvent {
     pub comm: [u8; 16],
     pub path: [u8; 256],
     pub classification: u8,
+    pub action: u8,
 }
 
 #[repr(u8)]
@@ -21,7 +22,26 @@ pub enum Classification {
     Outside = 5,
 }
 
+pub const CLASSIFICATIONS: usize = 6;
+
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Action {
+    Allow = 0,
+    Audit = 1,
+    Deny = 2,
+}
+
 impl Classification {
+    pub const ALL: [Self; CLASSIFICATIONS] = [
+        Self::Closure,
+        Self::Store,
+        Self::Wrapper,
+        Self::Memory,
+        Self::Deleted,
+        Self::Outside,
+    ];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Closure => "closure",
@@ -41,6 +61,27 @@ impl Classification {
             3 => Some(Self::Memory),
             4 => Some(Self::Deleted),
             5 => Some(Self::Outside),
+            _ => None,
+        }
+    }
+}
+
+impl Action {
+    pub const ALL: [Self; 3] = [Self::Allow, Self::Audit, Self::Deny];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Audit => "audit",
+            Self::Deny => "deny",
+        }
+    }
+
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Allow),
+            1 => Some(Self::Audit),
+            2 => Some(Self::Deny),
             _ => None,
         }
     }

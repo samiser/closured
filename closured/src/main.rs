@@ -3,14 +3,14 @@ use std::{collections::HashSet, io::Write as _, path::PathBuf, process::Command,
 use anyhow::Context as _;
 use aya::{
     Btf,
-    maps::{HashMap, RingBuf},
+    maps::{Array, HashMap, RingBuf},
     programs::Lsm,
 };
 use chrono::{SecondsFormat, Utc};
 use clap::{Parser, ValueEnum};
 #[rustfmt::skip]
 use log::{debug, warn};
-use closured_common::{Classification, ExecEvent, STORE_HASH_LEN};
+use closured_common::{Action, CLASSIFICATIONS, Classification, ExecEvent, STORE_HASH_LEN};
 use serde::Serialize;
 use tokio::{
     io::{Interest, unix::AsyncFd},
@@ -29,6 +29,14 @@ struct Args {
     /// Report every exec, not just those outside the allowed closure
     #[arg(long)]
     all: bool,
+
+    /// Block execs outside the allowed closure rather than only reporting them
+    #[arg(long)]
+    enforce: bool,
+
+    /// Per-classification overrides, e.g. --policy store=deny,wrapper=allow
+    #[arg(long, value_delimiter = ',', value_parser = parse_policy)]
+    policy: Vec<(Classification, Action)>,
 
     /// Closure roots whose requisites are allowed (defaults to
     /// /run/current-system and /run/booted-system when present)
@@ -67,6 +75,7 @@ struct EventMeta {
     #[serde(rename = "type")]
     r#type: [&'static str; 1],
     action: &'static str,
+    outcome: &'static str,
     provider: &'static str,
 }
 
@@ -85,6 +94,7 @@ struct UserFields {
 #[derive(Serialize)]
 struct ClosuredFields {
     classification: &'static str,
+    action: &'static str,
 }
 
 /// Adds a privileges hint when an eBPF setup step failed on permissions for a friendlier error
@@ -107,6 +117,53 @@ fn with_privilege_hint<T>(res: Result<T, impl Into<anyhow::Error>>) -> anyhow::R
 fn cstr(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+fn parse_policy(spec: &str) -> Result<(Classification, Action), String> {
+    let (class, action) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("expected <classification>=<action>, got `{spec}`"))?;
+    let class = Classification::ALL
+        .into_iter()
+        .find(|c| c.as_str() == class)
+        .ok_or_else(|| {
+            let known = Classification::ALL.map(Classification::as_str).join(", ");
+            format!("unknown classification `{class}`, expected one of: {known}")
+        })?;
+    let action = Action::ALL
+        .into_iter()
+        .find(|a| a.as_str() == action)
+        .ok_or_else(|| {
+            let known = Action::ALL.map(Action::as_str).join(", ");
+            format!("unknown action `{action}`, expected one of: {known}")
+        })?;
+    Ok((class, action))
+}
+
+fn policy_table(args: &Args) -> [Action; CLASSIFICATIONS] {
+    let mut table = [Action::Audit; CLASSIFICATIONS];
+    table[Classification::Closure as usize] = Action::Allow;
+
+    if args.enforce {
+        // wrappers stay permitted: they are setuid copies made by activation,
+        // never store paths, so denying them breaks sudo, passwd and friends
+        for class in [
+            Classification::Store,
+            Classification::Memory,
+            Classification::Deleted,
+            Classification::Outside,
+        ] {
+            table[class as usize] = Action::Deny;
+        }
+    }
+    if args.all {
+        table[Classification::Closure as usize] = Action::Audit;
+    }
+    // explicit overrides win over the presets above
+    for (class, action) in &args.policy {
+        table[*class as usize] = *action;
+    }
+    table
 }
 
 type StoreHash = [u8; STORE_HASH_LEN];
@@ -222,10 +279,13 @@ fn populate_allowed(
 fn handle_event(ev: &ExecEvent, format: Format) -> anyhow::Result<()> {
     let path = cstr(&ev.path);
     let comm = cstr(&ev.comm);
-    let Some(classification) = Classification::from_u8(ev.classification) else {
+    let (Some(classification), Some(action)) = (
+        Classification::from_u8(ev.classification),
+        Action::from_u8(ev.action),
+    ) else {
         warn!(
-            "dropping event with unknown classification {}: pid={} path={path}",
-            ev.classification, ev.pid
+            "dropping malformed event (classification {}, action {}): pid={} path={path}",
+            ev.classification, ev.action, ev.pid
         );
         return Ok(());
     };
@@ -240,8 +300,9 @@ fn handle_event(ev: &ExecEvent, format: Format) -> anyhow::Result<()> {
                 Classification::Deleted => "DELETED",
                 Classification::Outside => "OUTSIDE",
             };
+            let denied = if action == Action::Deny { " DENIED" } else { "" };
             println!(
-                "[{label}] pid={} uid={} comm={comm} path={path}",
+                "[{label}]{denied} pid={} uid={} comm={comm} path={path}",
                 ev.pid, ev.uid
             );
         }
@@ -256,6 +317,11 @@ fn handle_event(ev: &ExecEvent, format: Format) -> anyhow::Result<()> {
                     category: ["process"],
                     r#type: ["start"],
                     action: "exec",
+                    outcome: if action == Action::Deny {
+                        "failure"
+                    } else {
+                        "success"
+                    },
                     provider: "closured",
                 },
                 process: ProcessFields {
@@ -268,6 +334,7 @@ fn handle_event(ev: &ExecEvent, format: Format) -> anyhow::Result<()> {
                 },
                 closured: ClosuredFields {
                     classification: classification.as_str(),
+                    action: action.as_str(),
                 },
             };
             let mut out = std::io::stdout().lock();
@@ -294,6 +361,7 @@ async fn main() -> anyhow::Result<()> {
         debug!("remove limit on locked memory failed, ret is: {ret}");
     }
 
+    let policy = policy_table(&args);
     let roots = closure_roots(&args.roots);
     if roots.is_empty() {
         warn!("no closure roots found; every store exec will be reported");
@@ -305,14 +373,9 @@ async fn main() -> anyhow::Result<()> {
     // runtime. This approach is recommended for most real-world use cases. If you would
     // like to specify the eBPF program at runtime rather than at compile-time, you can
     // reach for `Bpf::load_file` instead.
-    let mut ebpf = with_privilege_hint(
-        aya::EbpfLoader::new()
-            .override_global("AUDIT_ALL", &u8::from(args.all), true)
-            .load(aya::include_bytes_aligned!(concat!(
-                env!("OUT_DIR"),
-                "/closured"
-            ))),
-    )?;
+    let mut ebpf = with_privilege_hint(aya::EbpfLoader::new().load(
+        aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/closured")),
+    ))?;
     match aya_log::EbpfLogger::init(&mut ebpf) {
         Err(e) => {
             // This can happen if you remove all log statements from your eBPF program.
@@ -330,9 +393,15 @@ async fn main() -> anyhow::Result<()> {
             });
         }
     }
-    // Fill the allowlist before the hook attaches so no exec sees a partial closure
+    // Fill the allowlist and policy before the hook attaches, so no exec sees a
+    // partial closure or an unset policy
     let mut allowed: HashMap<_, StoreHash, u8> = HashMap::try_from(ebpf.take_map("ALLOWED").unwrap())?;
     populate_allowed(&mut allowed, &HashSet::new(), &closure);
+
+    let mut policy_map: Array<_, u8> = Array::try_from(ebpf.take_map("POLICY").unwrap())?;
+    for (class, action) in policy.into_iter().enumerate() {
+        policy_map.set(class as u32, action as u8, 0)?;
+    }
 
     let btf = Btf::from_sys_fs()?;
     let program: &mut Lsm = ebpf
@@ -346,8 +415,13 @@ async fn main() -> anyhow::Result<()> {
     let mut ring = AsyncFd::with_interest(ring, Interest::READABLE)?;
 
     // stderr, so stdout stays pure event output in json mode
+    let mode = if policy.contains(&Action::Deny) {
+        "enforcing"
+    } else {
+        "auditing"
+    };
     eprintln!(
-        "closured: auditing execs against {} closure paths from {} root(s), Ctrl-C to exit",
+        "closured: {mode} execs against {} closure paths from {} root(s), Ctrl-C to exit",
         closure.len(),
         roots.len()
     );

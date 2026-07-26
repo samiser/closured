@@ -21,11 +21,13 @@ use aya_ebpf::{
         bpf_probe_read_kernel,
     },
     macros::{lsm, map},
-    maps::{HashMap, RingBuf},
+    maps::{Array, HashMap, RingBuf},
     programs::LsmContext,
 };
 use aya_log_ebpf::info;
-use closured_common::{Classification, ExecEvent, FLAG_TMPFS, FLAG_UNLINKED, STORE_HASH_LEN};
+use closured_common::{
+    Action, CLASSIFICATIONS, Classification, ExecEvent, FLAG_TMPFS, FLAG_UNLINKED, STORE_HASH_LEN,
+};
 use vmlinux::{file, linux_binprm, path};
 
 #[allow(improper_ctypes)]
@@ -40,8 +42,11 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static ALLOWED: HashMap<[u8; STORE_HASH_LEN], u8> = HashMap::with_max_entries(65536, 0);
 
-#[unsafe(no_mangle)]
-static AUDIT_ALL: u8 = 0;
+/// [`Action`] per [`Classification`], indexed by discriminant, set by userspace.
+#[map]
+static POLICY: Array<u8> = Array::with_max_entries(CLASSIFICATIONS as u32, 0);
+
+const EPERM: i32 = 1;
 
 const STORE_PREFIX: &[u8; 11] = b"/nix/store/";
 const WRAPPER_PREFIX: &[u8; 14] = b"/run/wrappers/";
@@ -90,10 +95,21 @@ fn classify(path: &[u8; 256], flags: u8) -> Classification {
     Classification::Outside
 }
 
+/// Falls back to [`Action::Audit`] so a missing or corrupt policy reports
+/// rather than silently permitting.
+#[inline(always)]
+fn policy_for(classification: Classification) -> Action {
+    POLICY
+        .get(classification as u32)
+        .copied()
+        .and_then(Action::from_u8)
+        .unwrap_or(Action::Audit)
+}
+
+/// Anything that goes wrong before a verdict is reached permits the exec.
 #[lsm(hook = "bprm_check_security")]
 pub fn bprm_check_security(ctx: LsmContext) -> i32 {
-    let _ = try_bprm_check_security(&ctx).unwrap_or(0);
-    0
+    try_bprm_check_security(&ctx).unwrap_or(0)
 }
 
 fn try_bprm_check_security(ctx: &LsmContext) -> Result<i32, i32> {
@@ -106,6 +122,7 @@ fn try_bprm_check_security(ctx: &LsmContext) -> Result<i32, i32> {
         comm: bpf_get_current_comm().unwrap_or_default(),
         path: [0u8; 256],
         classification: Classification::Outside as u8,
+        action: Action::Allow as u8,
     };
 
     let f_path = unsafe { &raw mut (*file).__bindgen_anon_1.f_path };
@@ -118,14 +135,17 @@ fn try_bprm_check_security(ctx: &LsmContext) -> Result<i32, i32> {
     let classification = classify(&ev.path, inode_flags(file).unwrap_or(0));
     ev.classification = classification as u8;
 
-    let audit_all = unsafe { core::ptr::read_volatile(&raw const AUDIT_ALL) } != 0;
-    if !audit_all && classification == Classification::Closure {
+    let action = policy_for(classification);
+    ev.action = action as u8;
+    if action == Action::Allow {
         return Ok(0);
     }
 
     info!(&ctx, "lsm hook bprm_check_security called");
-    EVENTS.output::<ExecEvent>(&ev, 0)?;
-    Ok(0)
+    // a full ring buffer must not turn a deny into an allow
+    let _ = EVENTS.output::<ExecEvent>(&ev, 0);
+
+    if action == Action::Deny { Ok(-EPERM) } else { Ok(0) }
 }
 
 #[cfg(not(test))]
