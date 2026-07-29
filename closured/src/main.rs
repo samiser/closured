@@ -1,4 +1,10 @@
-use std::{collections::HashSet, io::Write as _, path::PathBuf, process::Command, time::Duration};
+use std::{
+    collections::HashSet,
+    io::Write as _,
+    path::{Path, PathBuf},
+    process,
+    time::{Duration, Instant},
+};
 
 use anyhow::Context as _;
 use aya::{
@@ -7,20 +13,41 @@ use aya::{
     programs::Lsm,
 };
 use chrono::{SecondsFormat, Utc};
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 #[rustfmt::skip]
 use log::{debug, warn};
 use closured_common::{Action, CLASSIFICATIONS, Classification, ExecEvent, STORE_HASH_LEN};
 use serde::Serialize;
 use tokio::{
-    io::{Interest, unix::AsyncFd},
+    io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Interest, unix::AsyncFd},
+    net::{UnixListener, UnixStream},
     signal,
+    sync::{mpsc, oneshot},
 };
 
 const ECS_VERSION: &str = "8.17";
 
 #[derive(Parser)]
 #[command(version, about = "eBPF LSM exec auditor for NixOS closures")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    args: Args,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Allowlist a system closure before activating it. Returns once the
+    /// allowlist is updated, so the switch is safe immediately afterwards.
+    Preload {
+        /// System to activate, e.g. the `result` symlink from `nixos-rebuild build`
+        path: PathBuf,
+    },
+}
+
+#[derive(clap::Args)]
 struct Args {
     /// Output format for events on stdout
     #[arg(long, value_enum, default_value_t = Format::Json)]
@@ -42,6 +69,14 @@ struct Args {
     /// /run/current-system and /run/booted-system when present)
     #[arg(long = "root")]
     roots: Vec<PathBuf>,
+
+    /// Socket the daemon serves `preload` on, and the client connects to
+    #[arg(long, default_value = DEFAULT_CONTROL_SOCKET, global = true)]
+    control_socket: PathBuf,
+
+    /// Seconds a preloaded closure stays allowed if it is never activated
+    #[arg(long, default_value_t = 900)]
+    preload_ttl: u64,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -168,6 +203,8 @@ fn policy_table(args: &Args) -> [Action; CLASSIFICATIONS] {
 
 type StoreHash = [u8; STORE_HASH_LEN];
 
+const DEFAULT_CONTROL_SOCKET: &str = "/run/closured/control";
+
 // the system profile repoints before activation, so a deploy is allowed early
 const DEFAULT_ROOTS: [&str; 3] = [
     "/run/current-system",
@@ -199,7 +236,7 @@ fn gather_closure(roots: &[PathBuf]) -> anyhow::Result<HashSet<StoreHash>> {
 
     let mut hashes = HashSet::new();
     for root in targets {
-        let out = Command::new("nix-store")
+        let out = process::Command::new("nix-store")
             .args(["--query", "--requisites"])
             .arg(&root)
             .output()
@@ -254,26 +291,206 @@ fn watch_root_dirs(roots: &[PathBuf]) -> anyhow::Result<std::os::fd::OwnedFd> {
     Ok(fd)
 }
 
-fn populate_allowed(
-    allowed: &mut HashMap<aya::maps::MapData, StoreHash, u8>,
-    old: &HashSet<StoreHash>,
-    new: &HashSet<StoreHash>,
-) -> (usize, usize) {
-    let mut added = 0;
-    let mut removed = 0;
-    for hash in new.difference(old) {
-        match allowed.insert(hash, 1, 0) {
-            Ok(()) => added += 1,
-            Err(e) => warn!("failed to insert closure path into allowlist (map full?): {e}"),
+struct Preload {
+    path: PathBuf,
+    hashes: HashSet<StoreHash>,
+    expires: Instant,
+}
+
+struct Allowlist {
+    map: HashMap<aya::maps::MapData, StoreHash, u8>,
+    closure: HashSet<StoreHash>,
+    preloads: Vec<Preload>,
+    installed: HashSet<StoreHash>,
+}
+
+impl Allowlist {
+    fn sync(&mut self) -> (usize, usize) {
+        let mut desired = self.closure.clone();
+        for preload in &self.preloads {
+            desired.extend(&preload.hashes);
         }
-    }
-    for hash in old.difference(new) {
-        match allowed.remove(hash) {
-            Ok(()) => removed += 1,
-            Err(e) => warn!("failed to remove stale path from allowlist: {e}"),
+
+        let mut added = 0;
+        let mut still_absent = Vec::new();
+        for hash in desired.difference(&self.installed) {
+            match self.map.insert(hash, 1, 0) {
+                Ok(()) => added += 1,
+                Err(e) => {
+                    warn!("failed to insert closure path into allowlist (map full?): {e}");
+                    still_absent.push(*hash);
+                }
+            }
         }
+
+        let mut removed = 0;
+        let mut still_present = Vec::new();
+        for hash in self.installed.difference(&desired) {
+            match self.map.remove(hash) {
+                Ok(()) => removed += 1,
+                Err(e) => {
+                    warn!("failed to remove stale path from allowlist: {e}");
+                    still_present.push(*hash);
+                }
+            }
+        }
+
+        for hash in still_absent {
+            desired.remove(&hash);
+        }
+        desired.extend(still_present);
+        self.installed = desired;
+        (added, removed)
     }
-    (added, removed)
+
+    fn drop_covered_and_expired(&mut self, now: Instant) -> usize {
+        let before = self.preloads.len();
+        let closure = &self.closure;
+        self.preloads.retain(|preload| {
+            let reason = if preload.hashes.is_subset(closure) {
+                "activated"
+            } else if preload.expires <= now {
+                "expired without being activated"
+            } else {
+                return true;
+            };
+            eprintln!("closured: preload {} {reason}", preload.path.display());
+            false
+        });
+        before - self.preloads.len()
+    }
+}
+
+type PreloadRequest = (PathBuf, oneshot::Sender<Result<usize, String>>);
+
+async fn add_preload(
+    allowlist: &mut Allowlist,
+    path: PathBuf,
+    ttl: Duration,
+) -> Result<usize, String> {
+    if !path.starts_with("/nix/store") {
+        return Err(format!("{} is not a store path", path.display()));
+    }
+    let gathered = {
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || gather_closure(&[path])).await
+    };
+    let hashes = match gathered.unwrap_or_else(|e| Err(e.into())) {
+        Ok(hashes) => hashes,
+        Err(e) => return Err(format!("{e:#}")),
+    };
+
+    let total = hashes.len();
+    allowlist.preloads.retain(|preload| preload.path != path);
+    allowlist.preloads.push(Preload {
+        path: path.clone(),
+        hashes,
+        expires: Instant::now() + ttl,
+    });
+    let (added, _) = allowlist.sync();
+    eprintln!(
+        "closured: preloaded {} ({total} paths, {added} newly allowed)",
+        path.display()
+    );
+    Ok(added)
+}
+
+async fn serve_control_conn(
+    mut stream: UnixStream,
+    tx: mpsc::Sender<PreloadRequest>,
+) -> anyhow::Result<()> {
+    let peer = stream.peer_cred().context("reading peer credentials")?;
+    let (readable, mut writable) = stream.split();
+    let mut reader = BufReader::new(readable);
+
+    let reply = if peer.uid() != 0 {
+        warn!("rejected control connection from uid {}", peer.uid());
+        Err("permission denied".to_string())
+    } else {
+        let mut line = String::new();
+        reader.read_line(&mut line).await?;
+        match line.trim().split_once(' ') {
+            Some(("preload", path)) => {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                if tx.send((PathBuf::from(path), reply_tx)).await.is_err() {
+                    Err("closured is shutting down".to_string())
+                } else {
+                    reply_rx
+                        .await
+                        .unwrap_or_else(|_| Err("request dropped".to_string()))
+                }
+            }
+            _ => Err(format!("unknown command `{}`", line.trim())),
+        }
+    };
+
+    let line = match reply {
+        Ok(added) => format!("ok {added}\n"),
+        Err(msg) => format!("err {msg}\n"),
+    };
+    writable.write_all(line.as_bytes()).await?;
+    Ok(())
+}
+
+fn bind_control_socket(path: &Path) -> anyhow::Result<UnixListener> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(anyhow::Error::new(e).context(format!("removing stale {}", path.display())));
+    }
+    let listener =
+        UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .with_context(|| format!("restricting {} to its owner", path.display()))?;
+    Ok(listener)
+}
+
+async fn next_root_change(watcher: Option<&AsyncFd<std::os::fd::OwnedFd>>) {
+    use std::os::fd::AsRawFd as _;
+
+    let Some(watcher) = watcher else {
+        return std::future::pending().await;
+    };
+    loop {
+        let Ok(mut guard) = watcher.readable().await else {
+            continue;
+        };
+        let mut buf = [0u8; 4096];
+        let fd = watcher.get_ref().as_raw_fd();
+        while unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+        guard.clear_ready();
+        return;
+    }
+}
+
+async fn run_preload(socket: &Path, path: &Path) -> anyhow::Result<()> {
+    let canonical =
+        std::fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?;
+
+    let mut stream = UnixStream::connect(socket)
+        .await
+        .with_context(|| format!("connecting to {} (is closured running?)", socket.display()))?;
+    stream
+        .write_all(format!("preload {}\n", canonical.display()).as_bytes())
+        .await?;
+
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply).await?;
+    match reply.trim().split_once(' ') {
+        Some(("ok", added)) => {
+            eprintln!(
+                "closured: preloaded {} ({added} newly allowed)",
+                canonical.display()
+            );
+            Ok(())
+        }
+        Some(("err", msg)) => anyhow::bail!("closured refused the preload: {msg}"),
+        _ => anyhow::bail!("unexpected reply from closured: {:?}", reply.trim()),
+    }
 }
 
 fn handle_event(ev: &ExecEvent, path: &[u8], format: Format) -> anyhow::Result<()> {
@@ -351,8 +568,13 @@ fn handle_event(ev: &ExecEvent, path: &[u8], format: Format) -> anyhow::Result<(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let cli = Cli::parse();
+    let args = cli.args;
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+
+    if let Some(Command::Preload { path }) = &cli.command {
+        return run_preload(&args.control_socket, path).await;
+    }
 
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
     // new memcg based accounting, see https://lwn.net/Articles/837122/
@@ -399,9 +621,13 @@ async fn main() -> anyhow::Result<()> {
     }
     // Fill the allowlist and policy before the hook attaches, so no exec sees a
     // partial closure or an unset policy
-    let mut allowed: HashMap<_, StoreHash, u8> =
-        HashMap::try_from(ebpf.take_map("ALLOWED").unwrap())?;
-    populate_allowed(&mut allowed, &HashSet::new(), &closure);
+    let mut allowlist = Allowlist {
+        map: HashMap::try_from(ebpf.take_map("ALLOWED").unwrap())?,
+        closure,
+        preloads: Vec::new(),
+        installed: HashSet::new(),
+    };
+    allowlist.sync();
 
     let mut policy_map: Array<_, u8> = Array::try_from(ebpf.take_map("POLICY").unwrap())?;
     for (class, action) in policy.into_iter().enumerate() {
@@ -427,9 +653,35 @@ async fn main() -> anyhow::Result<()> {
     };
     eprintln!(
         "closured: {mode} execs against {} closure paths from {} root(s), Ctrl-C to exit",
-        closure.len(),
+        allowlist.closure.len(),
         roots.len()
     );
+
+    let (control_tx, mut control_rx) = mpsc::channel::<PreloadRequest>(8);
+    match bind_control_socket(&args.control_socket) {
+        Ok(listener) => {
+            eprintln!(
+                "closured: accepting preloads on {}",
+                args.control_socket.display()
+            );
+            tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, _)) => {
+                            let tx = control_tx.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = serve_control_conn(stream, tx).await {
+                                    warn!("control connection failed: {e:#}");
+                                }
+                            });
+                        }
+                        Err(e) => warn!("control socket accept failed: {e}"),
+                    }
+                }
+            });
+        }
+        Err(e) => warn!("preload unavailable: {e:#}"),
+    }
 
     // refresh the allowlist when a root repoints; the tick catches missed events
     let watcher = match watch_root_dirs(&roots) {
@@ -439,47 +691,47 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    let preload_ttl = Duration::from_secs(args.preload_ttl);
     tokio::spawn(async move {
-        use std::os::fd::AsRawFd as _;
-        let mut closure = closure;
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         tick.tick().await;
         loop {
-            match &watcher {
-                Some(watcher) => {
-                    tokio::select! {
-                        _ = tick.tick() => {}
-                        guard = watcher.readable() => {
-                            let Ok(mut guard) = guard else { continue };
-                            let mut buf = [0u8; 4096];
-                            let fd = watcher.get_ref().as_raw_fd();
-                            while unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } > 0
-                            {}
-                            guard.clear_ready();
-                        }
-                    }
-                }
-                None => {
-                    tick.tick().await;
-                }
-            }
-            let new_targets = root_targets(&roots);
-            if new_targets == targets {
+            let request = tokio::select! {
+                _ = tick.tick() => None,
+                Some(request) = control_rx.recv() => Some(request),
+                () = next_root_change(watcher.as_ref()) => None,
+            };
+
+            if let Some((path, reply)) = request {
+                let _ = reply.send(add_preload(&mut allowlist, path, preload_ttl).await);
                 continue;
             }
-            let gather_roots = roots.clone();
-            let gathered = tokio::task::spawn_blocking(move || gather_closure(&gather_roots)).await;
-            match gathered.unwrap_or_else(|e| Err(e.into())) {
-                Ok(new_closure) => {
-                    let (added, removed) = populate_allowed(&mut allowed, &closure, &new_closure);
-                    closure = new_closure;
-                    targets = new_targets;
-                    eprintln!(
-                        "closured: closure changed, allowlist refreshed (+{added} -{removed}, {} total)",
-                        closure.len()
-                    );
+
+            let new_targets = root_targets(&roots);
+            let closure_changed = new_targets != targets;
+            if closure_changed {
+                let gather_roots = roots.clone();
+                let gathered =
+                    tokio::task::spawn_blocking(move || gather_closure(&gather_roots)).await;
+                match gathered.unwrap_or_else(|e| Err(e.into())) {
+                    Ok(new_closure) => {
+                        allowlist.closure = new_closure;
+                        targets = new_targets;
+                    }
+                    Err(e) => {
+                        warn!("closure refresh failed, will retry: {e:#}");
+                        continue;
+                    }
                 }
-                Err(e) => warn!("closure refresh failed, will retry: {e:#}"),
+            }
+
+            let dropped = allowlist.drop_covered_and_expired(Instant::now());
+            if closure_changed || dropped > 0 {
+                let (added, removed) = allowlist.sync();
+                eprintln!(
+                    "closured: allowlist refreshed (+{added} -{removed}, {} total)",
+                    allowlist.installed.len()
+                );
             }
         }
     });

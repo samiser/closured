@@ -44,6 +44,9 @@ in {
         Restart = "on-failure";
         RestartSec = 5;
 
+        RuntimeDirectory = "closured";
+        RuntimeDirectoryMode = "0700";
+
         # Run with least privilege
         DynamicUser = true;
         AmbientCapabilities = ["CAP_BPF" "CAP_PERFMON" "CAP_MAC_ADMIN"];
