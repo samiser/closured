@@ -19,7 +19,10 @@ use log::{debug, warn};
 use closured_common::{Action, CLASSIFICATIONS, Classification, ExecEvent, STORE_HASH_LEN};
 use serde::Serialize;
 use tokio::{
-    io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Interest, unix::AsyncFd},
+    io::{
+        AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader, Interest,
+        unix::AsyncFd,
+    },
     net::{UnixListener, UnixStream},
     signal,
     sync::{mpsc, oneshot},
@@ -132,7 +135,6 @@ struct ClosuredFields {
     action: &'static str,
 }
 
-/// Adds a privileges hint when an eBPF setup step failed on permissions for a friendlier error
 fn with_privilege_hint<T>(res: Result<T, impl Into<anyhow::Error>>) -> anyhow::Result<T> {
     let err = match res {
         Ok(v) => return Ok(v),
@@ -180,8 +182,6 @@ fn policy_table(args: &Args) -> [Action; CLASSIFICATIONS] {
     table[Classification::Closure as usize] = Action::Allow;
 
     if args.enforce {
-        // wrappers stay permitted: they are setuid copies made by activation,
-        // never store paths, so denying them breaks sudo, passwd and friends
         for class in [
             Classification::Store,
             Classification::Memory,
@@ -194,7 +194,6 @@ fn policy_table(args: &Args) -> [Action; CLASSIFICATIONS] {
     if args.all {
         table[Classification::Closure as usize] = Action::Audit;
     }
-    // explicit overrides win over the presets above
     for (class, action) in &args.policy {
         table[*class as usize] = *action;
     }
@@ -205,7 +204,6 @@ type StoreHash = [u8; STORE_HASH_LEN];
 
 const DEFAULT_CONTROL_SOCKET: &str = "/run/closured/control";
 
-// the system profile repoints before activation, so a deploy is allowed early
 const DEFAULT_ROOTS: [&str; 3] = [
     "/run/current-system",
     "/run/booted-system",
@@ -264,7 +262,6 @@ fn root_targets(roots: &[PathBuf]) -> Vec<Option<PathBuf>> {
         .collect()
 }
 
-/// inotify fd on the roots' parent dirs, so a repointed root is seen immediately
 fn watch_root_dirs(roots: &[PathBuf]) -> anyhow::Result<std::os::fd::OwnedFd> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
@@ -363,6 +360,8 @@ impl Allowlist {
 
 type PreloadRequest = (PathBuf, oneshot::Sender<Result<usize, String>>);
 
+const MAX_REQUEST: u64 = 4096;
+
 async fn add_preload(
     allowlist: &mut Allowlist,
     path: PathBuf,
@@ -401,14 +400,16 @@ async fn serve_control_conn(
 ) -> anyhow::Result<()> {
     let peer = stream.peer_cred().context("reading peer credentials")?;
     let (readable, mut writable) = stream.split();
-    let mut reader = BufReader::new(readable);
+
+    let mut line = String::new();
+    BufReader::new(readable.take(MAX_REQUEST))
+        .read_line(&mut line)
+        .await?;
 
     let reply = if peer.uid() != 0 {
         warn!("rejected control connection from uid {}", peer.uid());
         Err("permission denied".to_string())
     } else {
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
         match line.trim().split_once(' ') {
             Some(("preload", path)) => {
                 let (reply_tx, reply_rx) = oneshot::channel();
@@ -429,6 +430,7 @@ async fn serve_control_conn(
         Err(msg) => format!("err {msg}\n"),
     };
     writable.write_all(line.as_bytes()).await?;
+    writable.shutdown().await?;
     Ok(())
 }
 
@@ -464,6 +466,13 @@ async fn next_root_change(watcher: Option<&AsyncFd<std::os::fd::OwnedFd>>) {
         while unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
         guard.clear_ready();
         return;
+    }
+}
+
+async fn next_expiry(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -696,10 +705,12 @@ async fn main() -> anyhow::Result<()> {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         tick.tick().await;
         loop {
+            let soonest_expiry = allowlist.preloads.iter().map(|p| p.expires).min();
             let request = tokio::select! {
                 _ = tick.tick() => None,
                 Some(request) = control_rx.recv() => Some(request),
                 () = next_root_change(watcher.as_ref()) => None,
+                () = next_expiry(soonest_expiry) => None,
             };
 
             if let Some((path, reply)) = request {
