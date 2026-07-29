@@ -97,6 +97,12 @@
 
     nixosModules.default = import ./nix/module.nix self;
 
+    checks = forAllSystems (system:
+      import ./nix/tests.nix {
+        inherit self;
+        pkgs = nixpkgs.legacyPackages.${system};
+      });
+
     devShells = forAllSystems (system: {
       default = (outputsFor system).devShell;
     });

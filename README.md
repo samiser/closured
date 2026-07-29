@@ -74,13 +74,21 @@ the moment it exits.
 `nixos-rebuild boot` followed by a reboot needs no preload at all because at
 boot `/run/current-system` already points at the new generation.
 
-Preloads are held until the closure catches up with them, and are removd after
+Preloads are held until the closure catches up with them, and are removed after
 `--preload-ttl` seconds (default 900) if the system is never activated, so
 abandoning a build does not leave it executable indefinitely.
 
 ## Development
 
 `nix develop` gives you a shell where you can build with cargo
+
+`nix flake check` runs two NixOS VM tests:
+
+- `checks.<system>.vm` covers enforcement, the control socket and preload
+  expiry.
+- `checks.<system>.switch` builds a second system generation, preloads it and
+  activates it under `--enforce`, then checks the preload is consumed once the
+  closure catches up.
 
 ## License
 
