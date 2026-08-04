@@ -47,7 +47,7 @@ service:
 
 ```nix
 {
-  inputs.closured.url = "github:Samiser/closured";
+  inputs.closured.url = "github:samiser/closured";
 
   imports = [inputs.closured.nixosModules.default];
   services.closured.enable = true;
